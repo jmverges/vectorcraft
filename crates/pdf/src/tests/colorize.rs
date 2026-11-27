@@ -839,15 +839,191 @@ fn a_devicen_image_of_process_plates_opens_in_cmyk() {
     assert_eq!(blobs[0].0.cmyk().unwrap().data, [0, 0, 0, 0, 255, 0, 0, 255]);
 }
 
-/// A DeviceN image of a spot ink and a process plate (a duotone) still opens as RGB: an image can
-/// hold one ink or the process plates, not both.
+/// The groups of ink images an image of several inks opens as, in paint order: each child's name,
+/// colorize paint, gray pixels and whether it overprints, and whether the group has an opacity mask.
+type InkGroup = (Vec<(Option<String>, Option<Paint>, Vec<u8>, bool)>, bool);
+
+fn ink_groups(d: &Document) -> Vec<InkGroup> {
+    let mut out = vec![];
+    d.walk(|n| {
+        let NodeKind::Group { children, .. } = &n.kind else { return };
+        if children.is_empty() || !children.iter().all(|c| matches!(c.kind, NodeKind::Image(_))) {
+            return;
+        }
+        let inks = children
+            .iter()
+            .map(|c| {
+                let NodeKind::Image(im) = &c.kind else { panic!("an image") };
+                let gray = craft_image_codecs::decode(&d.images[&im.key].bytes).unwrap();
+                assert_eq!(gray.layout(), craft_image_codecs::ChannelLayout::Gray, "a grayscale image");
+                (c.name.clone(), c.extras().colorize.as_deref().cloned(), gray.into_data(), c.extras().colorize_overprint)
+            })
+            .collect();
+        out.push((inks, n.extras().mask.is_some()));
+    });
+    out
+}
+
+/// Each DeviceN image of `pdf`: its colorant names, its samples and its soft mask's.
+fn devicen_images(pdf: &[u8]) -> Vec<(Vec<String>, Vec<u8>, Vec<u8>)> {
+    let file = Pdf::new(Arc::new(pdf.to_vec())).unwrap();
+    let mut out = vec![];
+    for o in file.objects() {
+        let Object::Stream(s) = o else { continue };
+        let d = s.dict();
+        let Some(a) = d.get::<Array<'_>>(b"ColorSpace").filter(|_| d.get::<Name<'_>>(b"Subtype").is_some_and(|n| n.as_ref() == b"Image")) else {
+            continue;
+        };
+        let mut it = a.flex_iter();
+        if it.next::<Name<'_>>().is_none_or(|n| n.as_ref() != b"DeviceN") {
+            continue;
+        }
+        let names = it.next::<Array<'_>>().unwrap().iter::<Name<'_>>().map(|n| n.as_str().to_string()).collect();
+        let mask = d.get::<Stream<'_>>(b"SMask").unwrap().decoded().unwrap().into_owned();
+        out.push((names, s.decoded().unwrap().into_owned(), mask));
+    }
+    out
+}
+
+/// A tint transform of Black and SpotRed to CMYK (0, red, red, black).
+const BLACK_RED: &str = "{ dup 3 -1 roll 0 4 1 roll }";
+/// A tint transform of SpotRed and SpotBlue to CMYK (blue, red, red, 0).
+const RED_BLUE: &str = "{ exch dup 0 }";
+
+/// A DeviceN image of a process plate and a spot ink (a duotone) opens as a group of two
+/// grayscale images, the file's first ink lowest: each holds its ink's tints, is colorized by the
+/// ink and overprints, so both inks print. The image's soft mask masks the group.
 #[test]
-fn a_duotone_devicen_image_still_opens_as_rgb() {
+fn a_duotone_devicen_image_opens_as_a_group_of_ink_images() {
     let space = format!("[/DeviceN [/Black /SpotRed] /DeviceCMYK {} 0 R]", first_extra(1) + 1);
-    let d = separation_page(&space, 2, 8, "", "FF0000FF", &[&type4("{ dup 3 -1 roll 0 4 1 roll }", 2)]);
-    let blobs = image_blobs(&d);
-    assert_eq!(blobs.len(), 1);
-    assert!(!blobs[0].0.is_cmyk() && !blobs[0].1, "RGB, not colorized");
+    // Pixels (Black, SpotRed): none, black at 1/3, red at 2/3, both.
+    let r = separation_report(&space, 4, 8, "", "0000 5500 00AA FFFF", &[&type4(BLACK_RED, 2)], "q 80 0 0 10 10 50 cm /Im1 Do Q");
+    let d = &r.document;
+    let groups = ink_groups(d);
+    let [(inks, masked)] = groups.as_slice() else { panic!("one group: {groups:?}") };
+    assert!(!masked);
+    let [(black_name, Some(black), black_gray, true), (red_name, Some(red), red_gray, true)] = inks.as_slice() else {
+        panic!("two colorized, overprinting images: {inks:?}")
+    };
+    assert_eq!((black_name.as_deref(), red_name.as_deref()), (Some("Black"), Some("SpotRed")));
+    assert_eq!(black, &Paint::solid(Color::cmyk(0.0, 0.0, 0.0, 1.0)));
+    assert_eq!(black_gray, &[255, 170, 255, 0], "Black's tints");
+    let Paint::Solid { swatch, tint, .. } = red else { panic!("{red:?}") };
+    assert_eq!((swatch.as_deref(), *tint), (Some("SpotRed"), 1.0));
+    assert_eq!(red_gray, &[255, 255, 85, 0], "SpotRed's tints");
+    assert!(d.swatch("SpotRed").is_some_and(|s| s.spot), "a spot swatch");
+    assert!(d.swatches.iter().all(|s| s.name != "Black" || !s.spot), "no spot swatch for a process plate");
+    assert_eq!(r.warnings.iter().filter(|w| w.contains("Overprint Preview")).count(), 1, "{:?}", r.warnings);
+
+    let smask = "<< /Type /XObject /Subtype /Image /Width 4 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /ASCIIHexDecode /Length 9 >>\nstream\nFF00FF00>\nendstream";
+    let more = format!("/SMask {} 0 R", first_extra(1) + 2);
+    let d = separation_page(&space, 4, 8, &more, "0000 5500 00AA FFFF", &[&type4(BLACK_RED, 2), smask]);
+    let groups = ink_groups(&d);
+    assert!(matches!(groups.as_slice(), [(inks, true)] if inks.len() == 2), "the group is masked: {groups:?}");
+    let mut own_masks = 0;
+    d.walk(|n| own_masks += usize::from(n.extras().colorize.is_some() && n.extras().mask.is_some()));
+    assert_eq!(own_masks, 0, "the ink images carry no mask of their own");
+}
+
+/// Exported again, an image of several inks puts each ink's tints on that ink's plate alone: one
+/// overprinting image an ink, in a DeviceN space of that ink, whose soft mask is the tints the
+/// file had for it. Printed separations show each ink's image on its own plate only.
+#[test]
+fn an_image_of_several_inks_exports_each_ink_on_its_own_plate() {
+    // (colorants, tint transform, samples a pixel, each ink's tints)
+    let two_spots = ("/SpotRed /SpotBlue", RED_BLUE, "0000 5500 00AA FFFF", vec![("SpotRed", [0, 85, 0, 255]), ("SpotBlue", [0, 0, 170, 255])]);
+    let process_and_spot = (
+        "/Cyan /Magenta /Yellow /Black /SpotRed",
+        "{ 5 1 roll pop pop pop pop 0 exch dup 0 }",
+        "0000000000 FF00000055 00AA0000AA 000011FFFF",
+        vec![
+            ("Cyan", [0, 255, 0, 0]),
+            ("Magenta", [0, 0, 170, 0]),
+            ("Yellow", [0, 0, 0, 17]),
+            ("Black", [0, 0, 0, 255]),
+            ("SpotRed", [0, 85, 170, 255]),
+        ],
+    );
+    for (colorants, tint, hex, want) in [two_spots, process_and_spot] {
+        let space = format!("[/DeviceN [{colorants}] /DeviceCMYK {} 0 R]", first_extra(1) + 1);
+        let d = separation_page(&space, 4, 8, "", hex, &[&type4(tint, want.len())]);
+        let out = pdf(&d);
+        let written = devicen_images(&out);
+        assert_eq!(written.len(), want.len(), "{colorants}: one image an ink, not {written:?}");
+        for (name, tints) in &want {
+            let Some((_, samples, mask)) = written.iter().find(|(names, ..)| names.as_slice() == [name.to_string()]) else {
+                panic!("{colorants}: no image in {name} alone among {written:?}")
+            };
+            assert!(samples.iter().all(|v| *v == 255), "{name}: the ink at 100 %, shown as much as its soft mask says");
+            assert_eq!(mask, tints, "{name}: the tints the file has for it");
+        }
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("/OP true/op true"), "{colorants}: the ink images overprint");
+
+        let settings: PrintSettings = serde_json::from_value(serde_json::json!({"output": {"mode": "separations"}})).unwrap();
+        let names: Vec<String> = print_inks(&d, &settings).0.into_iter().map(|i| i.name).collect();
+        let job = plan(&d, &PrintOptions { settings, ..Default::default() }).unwrap();
+        assert_eq!(names.len(), job.plates.len());
+        for (plate, p) in names.iter().zip(&job.plates) {
+            let mut shown = vec![];
+            for l in &p.layers {
+                l.walk(&mut |n| {
+                    if let (NodeKind::Image(im), true) = (&n.kind, n.visible) {
+                        shown.push((n.name.clone().unwrap(), p.image_blob(im).and_then(|b| b.coverage()).unwrap().2));
+                    }
+                });
+            }
+            match want.iter().find(|(name, _)| name == plate) {
+                Some((name, tints)) => assert_eq!(shown, [(name.to_string(), tints.to_vec())], "plate {plate}"),
+                None => assert!(shown.is_empty(), "plate {plate} has none of the image's inks: {shown:?}"),
+            }
+        }
+    }
+}
+
+/// Samples of 1 and 16 bits are unpacked a colorant, the Decode array applied, and the ink `None`,
+/// which paints nothing, gets no image.
+#[test]
+fn an_image_of_several_inks_reads_its_samples_and_decode_array() {
+    let space = format!("[/DeviceN [/SpotRed /None /SpotBlue] /DeviceCMYK {} 0 R]", first_extra(1) + 1);
+    let tint = type4("{ exch pop exch dup 0 }", 3);
+    // 16 bits, SpotRed inverted by the Decode array.
+    let d = separation_page(&space, 2, 16, "/Decode [1 0 0 1 0 1]", "FFFF FFFF 0000 0000 FFFF FFFF", &[&tint]);
+    let groups = ink_groups(&d);
+    let [(inks, _)] = groups.as_slice() else { panic!("one group: {groups:?}") };
+    let found: Vec<_> = inks.iter().map(|(name, _, gray, _)| (name.as_deref().unwrap(), gray.as_slice())).collect();
+    assert_eq!(found, [("SpotRed", &[255, 0][..]), ("SpotBlue", &[255, 0][..])]);
+    // 1 bit: three pixels of three samples, then the row's padding.
+    let d = separation_page(&space, 3, 1, "", "8680", &[&tint]);
+    let groups = ink_groups(&d);
+    let [(inks, _)] = groups.as_slice() else { panic!("one group: {groups:?}") };
+    let found: Vec<_> = inks.iter().map(|(name, _, gray, _)| (name.as_deref().unwrap(), gray.as_slice())).collect();
+    assert_eq!(found, [("SpotRed", &[0, 255, 0][..]), ("SpotBlue", &[255, 0, 0][..])]);
+}
+
+/// An image of several inks drawn twice is two groups over the same pixels. One whose tints can't
+/// be read (its data cut short) opens in RGB each time, with one warning and no swatch for its inks.
+#[test]
+fn an_image_of_several_inks_drawn_twice_or_unreadable() {
+    let space = format!("[/DeviceN [/SpotRed /SpotBlue] /DeviceCMYK {} 0 R]", first_extra(1) + 1);
+    let twice = "q 80 0 0 10 10 20 cm /Im1 Do Q q 80 0 0 10 10 60 cm /Im1 Do Q";
+    let r = separation_report(&space, 2, 8, "", "FF00 00FF", &[&type4(RED_BLUE, 2)], twice);
+    let groups = ink_groups(&r.document);
+    assert_eq!(groups.len(), 2, "{groups:?}");
+    assert_eq!(groups[0], groups[1]);
+    assert_eq!(r.document.images.len(), 2, "each ink's pixels are kept once");
+
+    let r = separation_report(&space, 2, 8, "", "FF00", &[&type4(RED_BLUE, 2)], twice);
+    assert!(ink_groups(&r.document).is_empty());
+    let mut colorized = vec![];
+    r.document.walk(|n| {
+        if matches!(n.kind, NodeKind::Image(_)) {
+            colorized.push(n.extras().colorize.is_some());
+        }
+    });
+    assert_eq!(colorized, [false, false]);
+    assert!(r.document.swatches.iter().all(|s| !s.spot), "no swatch for an ink nothing uses");
+    assert_eq!(r.warnings.iter().filter(|w| w.contains("several inks")).count(), 1, "{:?}", r.warnings);
 }
 
 /// A raster drawn again is placed from what the first drawing found, as the same image at its own

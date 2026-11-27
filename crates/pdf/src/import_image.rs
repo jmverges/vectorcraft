@@ -11,7 +11,9 @@
 //! carries it as the image's opacity mask ([`has_mask`]). A DeviceN image of process plates only
 //! keeps them the same way, as a CMYK image ([`process_devicen`]). An image of one ink (a
 //! Separation, or a DeviceN of one colorant) keeps it: its tints are read as a grayscale image
-//! ([`tint_gray`]) that the ink colorizes. Every other image is read as RGB by the interpreter.
+//! ([`tint_gray`]) that the ink colorizes. A DeviceN image of several inks, a spot ink among them,
+//! keeps each ink's tints the same way, as one grayscale image an ink ([`several_inks_space`],
+//! [`ink_grays`]). Every other image is read as RGB by the interpreter.
 
 use craft::pdf::syntax::object::stream::{ImageColorSpace, ImageDecodeParams};
 use craft::pdf::syntax::object::{Array, Dict, Name, Stream};
@@ -285,6 +287,77 @@ pub(crate) fn tint_gray(st: &Stream<'_>, width: u32, height: u32) -> Result<Vec<
             };
             let tint = (lo + v as f32 / max * (hi - lo)).clamp(0.0, 1.0);
             out.push(((1.0 - tint) * 255.0).round() as u8);
+        }
+    }
+    Ok(out)
+}
+
+/// An image in several inks read as RGB: why.
+pub(crate) const UNREAD_INKS: &str = "images in several inks whose samples couldn't be read were imported in RGB";
+
+/// An image in several inks came in as a group of images: what the user sees differs.
+pub(crate) const INKS_SPLIT: &str =
+    "images in several inks were imported as groups of overprinting images, one per ink: turn on Overprint Preview to see the inks together";
+
+/// The image's DeviceN colour space and its colorant names when it lays several inks that aren't
+/// all process plates (a duotone of Black and a spot ink, two spot inks, the process plates with
+/// a spot ink). `None` for a DeviceN of one colorant ([`one_ink_space`]), of process plates only
+/// ([`process_devicen`]), of more than 32 colorants (PDF's limit) or of no ink but `None`.
+pub(crate) fn several_inks_space<'a>(st: &Stream<'a>) -> Option<(Array<'a>, Vec<String>)> {
+    let d = st.dict();
+    let a = d.get::<Array<'a>>(key(d, b"ColorSpace", b"CS"))?;
+    let (device_n, names) = ink_names(&mut a.flex_iter())?;
+    let several = device_n && (2..=32).contains(&names.len()) && names.iter().any(|n| n != "None") && process_plates(d).is_none();
+    several.then_some((a, names))
+}
+
+/// The tints of each of the `comps` colorants of image `st` (`width` × `height` pixels, in a
+/// DeviceN space) as a grayscale image a colorant: white where it lays no ink, black at 100 %, its
+/// Decode array applied. Samples of 1, 2, 4, 8 or 16 bits (ISO 32000-1 §8.9.3: each row starts at
+/// a byte). `Err` (a warning) when they can't be read; an image codec's samples (a JPEG) aren't.
+pub(crate) fn ink_grays(st: &Stream<'_>, width: u32, height: u32, comps: usize) -> Result<Vec<Vec<u8>>, &'static str> {
+    let d = st.dict();
+    let bpc = d.get::<u8>(key(d, b"BitsPerComponent", b"BPC")).unwrap_or(8);
+    if !matches!(bpc, 1 | 2 | 4 | 8 | 16) || !(1..=32).contains(&comps) {
+        return Err(UNREAD_INKS);
+    }
+    // The same cap as CMYK images', on the samples too: no more of them than the largest CMYK image
+    // has, since each ink's are kept.
+    let n = u64::from(width) * u64::from(height);
+    if n == 0 || n > MAX_CMYK_PIXELS || n * comps as u64 > MAX_CMYK_PIXELS * 4 {
+        return Err(UNREAD_INKS);
+    }
+    let ranges: Vec<(f32, f32)> = match d.get::<Array<'_>>(key(d, b"Decode", b"D")).map(|a| a.iter::<f32>().collect::<Vec<_>>()) {
+        Some(v) if v.len() == 2 * comps && v.iter().all(|x| x.is_finite()) => v.as_chunks::<2>().0.iter().map(|p| (p[0], p[1])).collect(),
+        _ => vec![(0.0, 1.0); comps],
+    };
+    let params =
+        ImageDecodeParams { is_indexed: false, bpc: Some(bpc), num_components: u8::try_from(comps).ok(), target_dimension: None, width, height };
+    let decoded = st.decoded_image(&params).map_err(|_| UNREAD_INKS)?;
+    // An image codec lays its samples out its own way.
+    if decoded.image_data.is_some() {
+        return Err(UNREAD_INKS);
+    }
+    let bits = usize::from(bpc);
+    // Checked: 32 colorants of 2 bytes over `MAX_CMYK_PIXELS` don't fit a 32-bit `usize` (the web build).
+    let (w, h, n) = (usize::try_from(width).map_err(|_| UNREAD_INKS)?, usize::try_from(height).map_err(|_| UNREAD_INKS)?, n as usize);
+    let row = w.checked_mul(comps).and_then(|s| s.checked_mul(bits)).map(|b| b.div_ceil(8)).ok_or(UNREAD_INKS)?;
+    let data = row.checked_mul(h).and_then(|len| decoded.data.get(..len)).ok_or(UNREAD_INKS)?;
+    let max = ((1u32 << bits) - 1) as f32;
+    let mut out: Vec<Vec<u8>> = (0..comps).map(|_| Vec::with_capacity(n)).collect();
+    for line in data.chunks_exact(row) {
+        for x in 0..w {
+            for (c, (plane, (lo, hi))) in out.iter_mut().zip(&ranges).enumerate() {
+                let i = x * comps + c;
+                let v = match bits {
+                    16 => line.get(i * 2..i * 2 + 2).map_or(0, |s| s.iter().fold(0u32, |v, b| (v << 8) | u32::from(*b))),
+                    8 => line.get(i).map_or(0, |b| u32::from(*b)),
+                    // 1, 2 or 4 bits a sample, packed from the high bits of each byte.
+                    _ => line.get(i * bits / 8).map_or(0, |b| (u32::from(*b) >> (8 - bits - (i * bits) % 8)) & ((1 << bits) - 1)),
+                };
+                let tint = (lo + v as f32 / max * (hi - lo)).clamp(0.0, 1.0);
+                plane.push(((1.0 - tint) * 255.0).round() as u8);
+            }
         }
     }
     Ok(out)

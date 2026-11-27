@@ -286,6 +286,30 @@ impl<'a> Device<'a> for Builder<'_> {
                         return self.add_image_masked(key ^ 0x5e9_a7e5, make, transform, mask, Some(paint));
                     }
                 }
+                // An image of several inks, a spot ink among them, keeps them: each ink's tints
+                // as a grayscale image that the ink colorizes and that overprints, in a group
+                // that takes the image's mask. Read once per image, as an image of one ink is.
+                if !white {
+                    let found = match self.ink_images.get(&key) {
+                        Some(inks) => inks.clone().map(|inks| inks.into_iter().map(|(name, paint)| (name, paint, None)).collect::<Vec<_>>()),
+                        None => {
+                            let read = self.several_inks_image(st, w, h);
+                            self.ink_images.insert(key, read.as_ref().map(|inks| inks.iter().map(|(n, p, _)| (n.clone(), p.clone())).collect()));
+                            read.map(|inks| {
+                                inks.into_iter()
+                                    .map(|(name, paint, gray)| (name, paint, gray_png(gray, w, h).map(|png| ImageBlob::new("image/png", png))))
+                                    .collect()
+                            })
+                        }
+                    };
+                    if let Some(inks) = found {
+                        let mask = if crate::import_image::has_mask(st) { self.alpha_mask(key, &r, w, h, transform) } else { None };
+                        if inks.len() > 1 {
+                            self.warn(crate::import_image::INKS_SPLIT);
+                        }
+                        return self.add_ink_images(key, inks, (w, h), transform, mask);
+                    }
+                }
                 // JPEG passthrough for plain DeviceRGB/DeviceGray DCT images.
                 let dict = st.dict();
                 let filters = st.filters();

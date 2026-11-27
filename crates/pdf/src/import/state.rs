@@ -144,6 +144,10 @@ pub(super) struct Builder<'p> {
     /// Images in a Separation space, by key: the paint of their ink, or `None` when they open in
     /// RGB (an ink that can't be told, tints that can't be read).
     pub(super) separation_paints: HashMap<u128, Option<Paint>>,
+    /// Images in a DeviceN space of several inks, by key: each ink's name in the file and its
+    /// paint, in the file's order, or `None` when they open in RGB (an ink that can't be told,
+    /// tints that can't be read).
+    pub(super) ink_images: HashMap<u128, Option<Vec<(String, Paint)>>>,
     /// Mask keys of CMYK images whose mask turned out to hide nothing.
     pub(super) opaque: HashSet<u128>,
     pub(super) warnings: Vec<String>,

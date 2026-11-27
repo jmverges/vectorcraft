@@ -13,6 +13,9 @@ pub(super) const WHITE_KEY: u128 = 0x7717_e000_a1fa;
 /// Mixed into an image's cache key when a DeviceCMYK image there takes the output intent's profile.
 pub(super) const INTENT_KEY: u128 = 0x1e7e_0c3c_0b5a;
 
+/// Mixed into an image's cache key for the tints of each of its several inks (times the ink's place among them).
+pub(super) const INK_KEY: u128 = 0x1d_e71c_e9a7_e5b3;
+
 /// The name of the paths text imports as.
 pub(super) const TEXT_OUTLINES: &str = "<Text Outlines>";
 

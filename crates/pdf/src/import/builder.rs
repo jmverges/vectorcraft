@@ -1,7 +1,7 @@
 use super::cid::{CidText, FontInfo, comparable, font_chars, identify_glyph, matching_face, replacement, unify_radical};
 use super::entry::{
-    MAX_NESTED, OVERPRINT_UNREAD, OVERPRINT_ZERO_MODE, PATTERN_REUSE, RESHAPED_TEXT_NOTE, TEXT_OUTLINES, TOO_MANY_OBJECTS, UNMATCHED_GLYPHS_NOTE,
-    UNNAMED_CHARACTERS_NOTE, max_objects,
+    INK_KEY, MAX_NESTED, OVERPRINT_UNREAD, OVERPRINT_ZERO_MODE, PATTERN_REUSE, RESHAPED_TEXT_NOTE, TEXT_OUTLINES, TOO_MANY_OBJECTS,
+    UNMATCHED_GLYPHS_NOTE, UNNAMED_CHARACTERS_NOTE, max_objects,
 };
 use super::reshaped;
 use super::state::{
@@ -83,6 +83,7 @@ impl<'p> Builder<'p> {
             cmyk_keys: HashSet::new(),
             intent_cmyk: None,
             separation_paints: HashMap::new(),
+            ink_images: HashMap::new(),
             opaque: HashSet::new(),
             warnings: vec![],
             fonts: HashMap::new(),
@@ -1062,6 +1063,33 @@ impl<'p> Builder<'p> {
         Some((self.colors.native(space, &[1.0])?.paint(), gray))
     }
 
+    /// Image `st` of several inks, a spot ink among them (`w` × `h` pixels, in a DeviceN space):
+    /// each ink's name in the file, its paint at 100 % (a spot swatch, a process plate or
+    /// Registration) and its tints as gray pixels ([`crate::import_image::ink_grays`]), in the
+    /// file's order; the ink `None`, which paints nothing, is left out. `None` for another image,
+    /// an ink whose colour can't be told, or tints that can't be read (with a warning): the image
+    /// opens in RGB. The inks are only marked used once the tints are read.
+    pub(super) fn several_inks_image(
+        &mut self,
+        st: &craft::pdf::syntax::object::Stream<'_>,
+        w: u32,
+        h: u32,
+    ) -> Option<Vec<(String, Paint, Vec<u8>)>> {
+        let (array, names) = crate::import_image::several_inks_space(st)?;
+        let space = self.colors.array_space(&array)?;
+        let grays = crate::import_image::ink_grays(st, w, h, names.len()).map_err(|why| self.warn(why)).ok()?;
+        let mut inks = Vec::with_capacity(names.len());
+        for (i, (name, gray)) in names.iter().zip(grays).enumerate() {
+            if name == "None" {
+                continue;
+            }
+            // The ink alone at 100 %. A space with an ink whose colour can't be told gives none.
+            let alone: Vec<f32> = (0..names.len()).map(|j| if i == j { 1.0 } else { 0.0 }).collect();
+            inks.push((name.clone(), self.colors.native(space, &alone)?.paint(), gray));
+        }
+        Some(inks)
+    }
+
     pub(super) fn add_image(&mut self, key: u128, make: impl FnOnce() -> Option<(ImageBlob, u32, u32)>, xf: Affine) {
         self.add_image_masked(key, make, xf, None, None);
     }
@@ -1144,6 +1172,55 @@ impl<'p> Builder<'p> {
         n.extras_mut().mask = mask.map(Box::new);
         n.extras_mut().colorize = colorize.map(Box::new);
         self.push_node(n);
+    }
+
+    /// An image of several inks as a group of grayscale images, one an ink in the file's order
+    /// (the first lowest), each named after its ink, colorized with it and overprinting, so every
+    /// ink prints on its own plate over the others'. `inks`: each ink's name, paint and, the
+    /// first time the image is drawn, the blob of its tints (`w` × `h` pixels); `key`: the
+    /// image's, which each ink's blob is kept under with its place among them. The group carries
+    /// the opacity mask `mask` and the blend mode the image is drawn with. One ink alone needs no
+    /// group: it is added as an image of one ink is.
+    pub(super) fn add_ink_images(
+        &mut self,
+        key: u128,
+        inks: Vec<(String, Paint, Option<ImageBlob>)>,
+        (w, h): (u32, u32),
+        xf: Affine,
+        mask: Option<OpacityMask>,
+    ) {
+        let inks = match <[_; 1]>::try_from(inks) {
+            Ok([(_, paint, blob)]) => return self.add_image_masked(key ^ INK_KEY, || blob.map(|b| (b, w, h)), xf, mask, Some(paint)),
+            Err(inks) => inks,
+        };
+        let mut children = Vec::with_capacity(inks.len());
+        for (i, (name, paint, blob)) in inks.into_iter().enumerate() {
+            let ikey = key ^ INK_KEY.wrapping_mul(i as u128 + 1);
+            let k = match (self.image_keys.get(&ikey), blob) {
+                (Some((k, ..)), _) => k.clone(),
+                (None, Some(blob)) => {
+                    let k = blob.content_key();
+                    self.images.insert(k.clone(), blob);
+                    self.image_keys.insert(ikey, (k.clone(), w, h));
+                    k
+                }
+                (None, None) => {
+                    self.warn("an image could not be decoded and was skipped");
+                    return;
+                }
+            };
+            let im = ImageObject { key: k, width: w, height: h, xf, link: None, placement: Default::default(), pixels: None };
+            let mut n = Node::new(self.id(), NodeKind::Image(Box::new(im)));
+            n.name = Some(name);
+            n.extras_mut().colorize = Some(Box::new(paint));
+            n.extras_mut().colorize_overprint = true;
+            children.push(Arc::new(n));
+        }
+        let mut group = Node::group(self.id(), children);
+        group.extras_mut().mask = mask.map(Box::new);
+        // `push_node` gives the blend mode to objects, not to groups.
+        group.blend = self.blend;
+        self.push_node(group);
     }
 
     /// Mesh shadings filling `region` (document space): gradient meshes, clipped to the region
